@@ -1,0 +1,8 @@
+build/
+.vscode/
+*.o
+*.a
+compile_commands.json
+__pycache__/
+.venv/
+.env
