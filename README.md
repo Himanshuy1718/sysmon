@@ -21,7 +21,7 @@ LLM with retrieval-augmented generation (RAG).
 |---|-----------|--------|
 | 1 | `/proc` parsers, metric collector, unit tests | ✅ Done |
 | 2 | Thread-safe queue + collector/sender threads | ✅ Done |
-| 3 | TCP server + agent client, framing, heartbeat, reconnect | ⏳ |
+| 3 | TCP server + agent client, framing, heartbeat, reconnect | ✅ Done |
 | 4 | PostgreSQL storage | ⏳ |
 | 5 | Anomaly detector + alerts | ⏳ |
 | 6 | FastAPI REST API | ⏳ |
@@ -42,7 +42,7 @@ wsl --install -d Ubuntu-24.04
 **2. Inside Ubuntu, install the toolchain:**
 ```bash
 sudo apt update
-sudo apt install -y build-essential cmake git libgtest-dev
+sudo apt install -y build-essential cmake git libgtest-dev nlohmann-json3-dev
 ```
 
 **3. Keep the project inside the Linux filesystem** (e.g. `~/projects/sysmon`),
@@ -56,7 +56,7 @@ from the project folder in Ubuntu. Add the *C/C++* and *CMake Tools* extensions.
 ```bash
 cmake -S . -B build
 cmake --build build -j
-ctest --test-dir build --output-on-failure     # 31 tests
+ctest --test-dir build --output-on-failure     # 55 tests
 ./build/agent/sysmon_agent --interval 2         # Ctrl+C to stop
 ./build/agent/sysmon_agent --interval 1 --count 5
 ```
@@ -79,25 +79,28 @@ or `dd if=/dev/zero of=/tmp/big bs=1M count=500` (disk). Remove `/tmp/big` after
 
 ```
 sysmon/
-├── CMakeLists.txt                  # top-level build
-└── agent/
-    ├── CMakeLists.txt              # library + agent binary + tests
+├── CMakeLists.txt
+├── common/                         # shared by agent and server
+│   ├── include/sysmon/
+│   │   ├── metrics.hpp             # data structs
+│   │   ├── socket.hpp              # RAII sockets, framing, connect/listen
+│   │   └── protocol.hpp            # JSON messages: hello / metrics / heartbeat
+│   └── src/  socket.cpp  protocol.cpp
+├── agent/                          # runs on every monitored machine
+│   ├── include/sysmon/
+│   │   ├── proc_parser.hpp         # /proc parsers
+│   │   ├── collector.hpp           # counters -> rates
+│   │   ├── thread_safe_queue.hpp   # bounded producer–consumer queue
+│   │   ├── agent.hpp               # collector thread + sender thread
+│   │   └── tcp_client.hpp          # send to server, reconnect with backoff
+│   ├── src/ ...  main.cpp
+│   └── tests/                      # 31 tests
+└── server/                         # central collector
     ├── include/sysmon/
-    │   ├── metrics.hpp             # data structs (raw counters + snapshot)
-    │   ├── proc_parser.hpp         # /proc parsers + ProcReader
-    │   └── collector.hpp           # turns counters into rates
-    │   ├── thread_safe_queue.hpp   # bounded blocking producer–consumer queue
-    │   └── agent.hpp               # collector thread + sender thread
-    ├── src/
-    │   ├── proc_parser.cpp
-    │   ├── collector.cpp
-    │   ├── agent.cpp
-    │   └── main.cpp                # CLI, Ctrl+C handling
-    └── tests/
-        ├── test_proc_parser.cpp    # parser tests on fake /proc text
-        ├── test_collector.cpp      # collector tests on a fake /proc directory
-        ├── test_thread_safe_queue.cpp  # incl. 4x4 thread stress test
-        └── test_agent.cpp          # threads, shutdown, slow sender
+    │   ├── node_registry.hpp       # which nodes exist, UP/DOWN, last data
+    │   └── server.hpp              # accept thread, handler threads, watchdog
+    ├── src/ ...  main.cpp
+    └── tests/                      # 23 tests: protocol, framing, end-to-end
 ```
 
 ---
@@ -259,7 +262,145 @@ Doing step 3 before step 2 could lose snapshots. Forgetting to `join()` a
 9. What is a deadlock? Could this code deadlock? (No: there is only one lock
    per object, and no lock is held while calling the sink.)
 
-## Next: Milestone 3
-Replace the print sink with a **TCP client** in the agent and build the
-**collector server**: message framing, multiple clients, heartbeat and
-auto-reconnect.
+## Milestone 3 — concepts explained
+
+### Try it: one server, two agents (three Ubuntu tabs)
+```bash
+# Tab 1 — server (marks a node DOWN after 5 s of silence)
+./build/server/sysmon_server --port 9000 --timeout 5
+
+# Tab 2 and Tab 3 — two agents pretending to be two machines
+./build/agent/sysmon_agent --server 127.0.0.1:9000 --name node-1 --interval 1
+./build/agent/sysmon_agent --server 127.0.0.1:9000 --name node-2 --interval 1
+```
+Then:
+- **Ctrl+C node-2.** After 5 s the server prints `node node-2 is DOWN`.
+- **Ctrl+C the server, wait, start it again.** node-1 prints
+  `connection lost, reconnecting...`, retries, then `connected` by itself.
+
+### How the pieces talk
+```
+agent: collector thread ─► queue ─► sender thread ─► TcpClient ══TCP══►  server
+                                                                           │
+                       accept thread ─► one handler thread per agent ─► NodeRegistry
+                       watchdog thread: every 1 s, silent nodes ─► DOWN
+```
+
+### 1. TCP is a byte stream, so we need framing
+TCP guarantees bytes arrive **in order and complete**, but **not in the same
+pieces they were sent in**. Two 500-byte messages can arrive as one
+1000-byte chunk, or as 3 bytes + 997 bytes. So each message is sent as
+```
+[4-byte length][payload]
+```
+The reader calls `read_exact(4)`, learns the length, then `read_exact(length)`.
+`read_exact` loops, because `recv()` may return fewer bytes than asked
+(a **partial read**). `write_all` does the same for **partial writes**.
+- The length is in **network byte order** (big-endian, `htonl`/`ntohl`), so
+  machines with different CPUs agree on the number.
+- Frames over **1 MiB are rejected**. Otherwise a broken or malicious client
+  could say "I'm sending 4 GB" and make the server allocate it.
+
+### 2. The messages (JSON)
+```json
+{"type":"hello","host":"node-1","version":1}
+{"type":"metrics","host":"node-1","data":{"cpu":12.5, ...}}
+{"type":"heartbeat","host":"node-1","ts":1794553548970}
+```
+Every connection starts with `hello`, so the server knows who is talking.
+Anything else first, or invalid JSON, closes **that one connection** and
+never crashes the server. JSON is easy to read and debug. Protocol Buffers
+would be smaller and faster, which is a good "future work" answer.
+
+### 3. Server: thread per connection
+- **accept thread:** waits for new agents and starts a handler thread for each.
+- **handler thread:** reads frames from its agent and updates the registry.
+- **watchdog thread:** marks nodes with no message for `--timeout` seconds as DOWN.
+
+`accept()` and `recv()` would block forever, so they wait with `poll()` in
+200 ms slices and check a `stopping_` flag. That's how the server shuts down
+cleanly. Finished handler threads are joined ("reaped") by the accept loop.
+
+**Scaling:** thread-per-connection is fine for hundreds of agents. For
+thousands you would use **epoll**, an event loop where one thread watches
+many sockets and handles whichever is ready. Nginx and Redis work this way.
+
+### 4. Heartbeats: telling "quiet" apart from "dead"
+If no metrics arrive, the agent might be dead, or just idle with a long
+interval. So when the sender has had nothing to send for `--heartbeat`
+seconds (default 5), it sends a tiny heartbeat. It reuses the queue's
+`pop_for(timeout)`: a timeout means "nothing to send, so send a heartbeat".
+The server uses **any** message as proof of life.
+
+### 5. Reconnecting with exponential backoff
+When a send fails, the client closes the socket and retries after
+0.5 s, 1 s, 2 s, 4 s … up to 10 s. Retrying in a tight loop would hammer a
+server that is trying to recover, and with 1000 agents that could knock it
+over again (a "thundering herd"). While reconnecting, the sender thread
+waits, the agent's bounded queue keeps buffering, and the oldest snapshots
+are dropped if the outage lasts long.
+
+### 6. Socket details worth knowing
+| Detail | Why |
+|---|---|
+| `MSG_NOSIGNAL` on send | Writing to a closed socket raises **SIGPIPE**, which kills the process by default. With this flag, send just returns an error. |
+| `SO_REUSEADDR` | Lets the server restart on the same port immediately, instead of waiting ~60 s for the old connection to leave **TIME_WAIT**. |
+| `SO_SNDTIMEO` | A send (and on Linux, `connect`) can't block forever on a stuck peer. |
+| `TCP_NODELAY` | Disables Nagle's algorithm, which delays small packets to batch them. Our messages are small and we want them sent now. |
+| `Socket` RAII class | The file descriptor is closed automatically, even on exceptions, so there are no fd leaks. Move-only, so there are never two owners. |
+
+### 7. Detecting a dead connection before writing (a bug found in testing)
+**The bug:** after the server restarted, the first snapshots were lost.
+TCP lets you write into a connection the other side has already closed: the
+kernel accepts the bytes, and the error only shows up on a later write. So
+`send()` "succeeded" while the data went nowhere. The test for this passed
+on one machine and failed on WSL, because the timing of the error differs.
+
+**The fix:** when a server process closes or exits, the kernel sends a
+**FIN** ("I'm closing"). Before every send, the client checks for it:
+`poll()` with timeout 0, then `recv(MSG_PEEK)`. If `recv` returns 0, the
+peer has closed, so the client reconnects first and then sends. Our server
+never sends data to the agent, so "readable" can only mean "closed".
+Result: a server restart loses **zero** snapshots (`sent=8`, server received 8).
+
+**What is still not covered:** if the server **machine** loses power or
+the network cable is pulled, no FIN is ever sent, so one snapshot can still
+be lost. TCP alone cannot tell you the *application* received your data.
+The complete fix is application-level **acknowledgements**: the server
+replies `{"ack": seq}` and the agent resends anything unacknowledged after
+reconnecting. That gives **at-least-once** delivery, so the server must
+ignore duplicates (by host + timestamp). For monitoring, losing one sample in
+a power failure is an acceptable trade-off.
+
+### How it's tested (23 tests)
+- **Framing on a `socketpair`:** frames written back to back stay separate,
+  a frame sent **one byte at a time** is reassembled, oversized frames are
+  rejected, and a close mid-frame is an error rather than a clean close.
+- Writing to a closed peer returns an error instead of killing the test (SIGPIPE).
+- **End-to-end over real localhost TCP:**
+  - 8 agents × 25 snapshots at once all arrive
+  - the client keeps retrying until a late server starts, without losing its snapshot
+  - the client survives a server restart **without losing any snapshot**
+  - `peer_closed()` detects a FIN but ignores ordinary pending data
+  - a silent node is marked DOWN
+  - garbage input drops only that connection
+  - `request_stop()` interrupts a long backoff wait
+
+### Questions to be ready for
+1. Why do you need framing on top of TCP? What is a partial read?
+2. TCP vs UDP: which did you use and why? (TCP: ordered, reliable, and
+   losing a metrics message silently is worse than a little overhead.)
+3. Walk me through `socket → bind → listen → accept` and `socket → connect`.
+4. What is SIGPIPE and how did you avoid it?
+5. Why `SO_REUSEADDR`? What is TIME_WAIT?
+6. How does the server handle many clients? How would you scale to 10,000? (epoll)
+7. How do you detect that an agent died? Why heartbeats?
+8. Why exponential backoff? What is a thundering herd?
+9. Can data be lost? When? How would you guarantee delivery? (acks, at-least-once, dedupe)
+10. What happens if a client sends garbage or claims a 4 GB message?
+11. Tell me about a bug you found. (The restart data loss: write "succeeds" on a
+    closed connection; fixed by checking for FIN with poll + MSG_PEEK before sending.)
+
+## Next: Milestone 4
+Store every snapshot in **PostgreSQL**: schema design for time-series data,
+indexes, and a writer that doesn't slow down the network threads.

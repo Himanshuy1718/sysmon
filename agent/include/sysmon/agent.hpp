@@ -25,17 +25,20 @@
 
 namespace sysmon {
 
-// Where snapshots go. Milestone 2: print to terminal. Milestone 3: TCP.
+// Where snapshots go: print to terminal, or TCP to the server.
 using Sink = std::function<void(const MetricSnapshot&)>;
+// Called by the sender thread when nothing was sent for `heartbeat_sec`.
+using Heartbeat = std::function<void()>;
 
 struct AgentConfig {
     double interval_sec = 2.0;      // time between samples
     std::size_t queue_capacity = 100;  // snapshots buffered before dropping oldest
+    double heartbeat_sec = 0;       // 0 = no heartbeats
 };
 
 class Agent {
 public:
-    Agent(Collector collector, Sink sink, AgentConfig config = {});
+    Agent(Collector collector, Sink sink, AgentConfig config = {}, Heartbeat heartbeat = {});
     ~Agent();  // calls stop() — threads are never left running (RAII)
 
     Agent(const Agent&) = delete;
@@ -45,6 +48,10 @@ public:
     // Stops collecting, lets the sender finish what is queued, joins both
     // threads. Safe to call more than once.
     void stop();
+
+    // Optional: called at the start of stop(), after the agent has marked
+    // itself as shutting down (used to abort the TCP client's reconnect wait).
+    void set_on_stopping(std::function<void()> hook) { on_stopping_ = std::move(hook); }
 
     std::uint64_t collected() const { return collected_.load(); }
     std::uint64_t sent() const { return sent_.load(); }
@@ -58,6 +65,8 @@ private:
     Collector collector_;
     Sink sink_;
     AgentConfig config_;
+    Heartbeat heartbeat_;
+    std::function<void()> on_stopping_;
     ThreadSafeQueue<MetricSnapshot> queue_;
 
     std::thread collector_thread_;
@@ -74,6 +83,14 @@ private:
     std::atomic<std::uint64_t> collected_{0};
     std::atomic<std::uint64_t> sent_{0};
     std::atomic<std::uint64_t> errors_{0};
+    std::atomic<std::uint64_t> heartbeats_{0};
+    std::atomic<std::uint64_t> unsent_at_shutdown_{0};
+    std::atomic<bool> draining_{false};  // stop() in progress: expected failures are not logged
+
+public:
+    std::uint64_t heartbeats() const { return heartbeats_.load(); }
+    // Snapshots still queued at shutdown that could not be delivered.
+    std::uint64_t unsent_at_shutdown() const { return unsent_at_shutdown_.load(); }
 };
 
 }  // namespace sysmon

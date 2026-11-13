@@ -103,3 +103,19 @@ TEST(Agent, DestructorStopsThreads) {
     }  // no explicit stop(): RAII must join both threads, or std::terminate is called
     SUCCEED();
 }
+
+TEST(Agent, UndeliverableAtShutdownIsCountedNotLoggedAsErrors) {
+    if (!have_proc()) GTEST_SKIP();
+    std::atomic<bool> fail{false};
+    Agent agent(Collector{}, [&](const MetricSnapshot&) {
+        if (fail) throw std::runtime_error("server unreachable");
+        std::this_thread::sleep_for(200ms);  // slow, so snapshots pile up in the queue
+    }, AgentConfig{0.01, 50});
+    agent.start();
+    std::this_thread::sleep_for(150ms);
+    agent.set_on_stopping([&] { fail = true; });  // destination unreachable from shutdown on
+    agent.stop();  // queued leftovers fail while draining
+    EXPECT_GT(agent.unsent_at_shutdown(), 0u);
+    EXPECT_EQ(agent.errors(), 0u);
+    EXPECT_EQ(agent.sent() + agent.unsent_at_shutdown(), agent.collected());
+}
