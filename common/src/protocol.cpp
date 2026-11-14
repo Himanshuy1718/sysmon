@@ -72,6 +72,10 @@ MetricSnapshot from_json_obj(const json& j) {
 
 std::string snapshot_to_json(const MetricSnapshot& s) { return to_json_obj(s).dump(); }
 
+std::string processes_to_json(const std::vector<ProcessUsage>& list) {
+    return process_list_to_json(list).dump();
+}
+
 MetricSnapshot snapshot_from_json(const std::string& text) {
     try {
         return from_json_obj(json::parse(text));

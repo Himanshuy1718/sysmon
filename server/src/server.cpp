@@ -135,6 +135,7 @@ void Server::handle_client(net::Socket socket, std::string address, Connection* 
                 m.type == protocol::MessageType::Metrics ? &m.snapshot : nullptr;
             if (registry_.touch(host, address, Clock::now(), snap)) {
                 event("node " + host + " is UP");
+                if (on_status_) on_status_(host, address, true, protocol::now_ms());
             }
             if (snap && on_metrics_) on_metrics_(*snap);
         } catch (const std::exception& e) {
@@ -153,6 +154,7 @@ void Server::watchdog_loop() {
         watchdog_cv_.wait_for(lock, config_.watchdog_period, [this] { return stopping_.load(); });
         if (stopping_) break;
         for (const auto& host : registry_.mark_stale(Clock::now(), config_.node_timeout)) {
+            if (on_status_) on_status_(host, "", false, protocol::now_ms());
             event("node " + host + " is DOWN (no data for " +
                   std::to_string(config_.node_timeout.count() / 1000.0).substr(0, 4) + " s)");
         }

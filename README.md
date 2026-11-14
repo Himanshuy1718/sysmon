@@ -22,7 +22,7 @@ LLM with retrieval-augmented generation (RAG).
 | 1 | `/proc` parsers, metric collector, unit tests | ✅ Done |
 | 2 | Thread-safe queue + collector/sender threads | ✅ Done |
 | 3 | TCP server + agent client, framing, heartbeat, reconnect | ✅ Done |
-| 4 | PostgreSQL storage | ⏳ |
+| 4 | PostgreSQL storage | ✅ Done |
 | 5 | Anomaly detector + alerts | ⏳ |
 | 6 | FastAPI REST API | ⏳ |
 | 7 | RAG diagnostics assistant (Ollama) | ⏳ |
@@ -42,7 +42,8 @@ wsl --install -d Ubuntu-24.04
 **2. Inside Ubuntu, install the toolchain:**
 ```bash
 sudo apt update
-sudo apt install -y build-essential cmake git libgtest-dev nlohmann-json3-dev
+sudo apt install -y build-essential cmake git libgtest-dev nlohmann-json3-dev \
+                    postgresql libpq-dev pkg-config
 ```
 
 **3. Keep the project inside the Linux filesystem** (e.g. `~/projects/sysmon`),
@@ -56,7 +57,7 @@ from the project folder in Ubuntu. Add the *C/C++* and *CMake Tools* extensions.
 ```bash
 cmake -S . -B build
 cmake --build build -j
-ctest --test-dir build --output-on-failure     # 55 tests
+ctest --test-dir build --output-on-failure     # 68 tests (7 skipped without a DB)
 ./build/agent/sysmon_agent --interval 2         # Ctrl+C to stop
 ./build/agent/sysmon_agent --interval 1 --count 5
 ```
@@ -83,6 +84,7 @@ sysmon/
 ├── common/                         # shared by agent and server
 │   ├── include/sysmon/
 │   │   ├── metrics.hpp             # data structs
+│   │   ├── thread_safe_queue.hpp   # bounded producer–consumer queue (agent + server)
 │   │   ├── socket.hpp              # RAII sockets, framing, connect/listen
 │   │   └── protocol.hpp            # JSON messages: hello / metrics / heartbeat
 │   └── src/  socket.cpp  protocol.cpp
@@ -90,17 +92,23 @@ sysmon/
 │   ├── include/sysmon/
 │   │   ├── proc_parser.hpp         # /proc parsers
 │   │   ├── collector.hpp           # counters -> rates
-│   │   ├── thread_safe_queue.hpp   # bounded producer–consumer queue
 │   │   ├── agent.hpp               # collector thread + sender thread
 │   │   └── tcp_client.hpp          # send to server, reconnect with backoff
 │   ├── src/ ...  main.cpp
-│   └── tests/                      # 31 tests
-└── server/                         # central collector
-    ├── include/sysmon/
-    │   ├── node_registry.hpp       # which nodes exist, UP/DOWN, last data
-    │   └── server.hpp              # accept thread, handler threads, watchdog
-    ├── src/ ...  main.cpp
-    └── tests/                      # 23 tests: protocol, framing, end-to-end
+│   └── tests/                      # 32 tests
+├── server/                         # central collector
+│   ├── include/sysmon/
+│   │   ├── node_registry.hpp       # which nodes exist, UP/DOWN, last data
+│   │   ├── server.hpp              # accept thread, handler threads, watchdog
+│   │   ├── store.hpp               # storage interface (fake in tests, PostgreSQL for real)
+│   │   ├── db_writer.hpp           # background batching writer with retries
+│   │   └── pg_store.hpp            # PostgreSQL via libpq: transactions, prepared statements
+│   ├── sql/schema.sql              # tables + indexes (embedded into the binary)
+│   ├── src/ ...  main.cpp
+│   └── tests/                      # 36 tests: protocol, framing, end-to-end, storage
+└── scripts/
+    ├── setup_db.sh                 # create the sysmon database user and database
+    └── queries.sql                 # example SQL queries over the collected data
 ```
 
 ---
@@ -401,6 +409,135 @@ a power failure is an acceptable trade-off.
 11. Tell me about a bug you found. (The restart data loss: write "succeeds" on a
     closed connection; fixed by checking for FIN with poll + MSG_PEEK before sending.)
 
-## Next: Milestone 4
-Store every snapshot in **PostgreSQL**: schema design for time-series data,
-indexes, and a writer that doesn't slow down the network threads.
+## Milestone 4 — concepts explained
+
+### Setup (once)
+```bash
+sudo apt install -y postgresql libpq-dev pkg-config
+./scripts/setup_db.sh            # creates user "sysmon" and database "sysmon"
+```
+WSL doesn't always start services automatically. If the database isn't
+running after a reboot: `sudo service postgresql start`.
+To free its ~30 MB of RAM when you're not using it: `sudo service postgresql stop`.
+
+### Try it
+```bash
+# Tab 1: server writing to the database
+./build/server/sysmon_server --port 9000 --timeout 5 --quiet \
+    --db postgresql://sysmon:sysmon@localhost:5432/sysmon
+
+# Tab 2 and Tab 3: agents as before
+./build/agent/sysmon_agent --server 127.0.0.1:9000 --name node-1 --interval 1
+./build/agent/sysmon_agent --server 127.0.0.1:9000 --name node-2 --interval 1
+
+# Tab 4: look at the data
+psql postgresql://sysmon:sysmon@localhost:5432/sysmon -f scripts/queries.sql
+```
+**Resilience test:** while everything runs, `sudo service postgresql stop`,
+wait 10 s, then `sudo service postgresql start`. The server logs retries,
+then catches up. Query 7 in `queries.sql` (gaps) shows **no missing data**.
+
+### Schema (`server/sql/schema.sql`)
+| Table | One row per | Notes |
+|---|---|---|
+| `nodes` | machine | current status UP/DOWN, last_seen |
+| `metrics` | snapshot | the time series; top processes as **JSONB** |
+| `node_events` | UP/DOWN change | history of outages |
+
+- **Foreign keys** (`metrics.host → nodes.host`): the database itself refuses
+  a metric for an unknown node.
+- **CHECK constraints** (`status IN ('UP','DOWN')`): invalid values are
+  impossible to store.
+- **Index `(host, ts DESC)`**: almost every query asks for "node X in a
+  time window, newest first". With the index, PostgreSQL jumps straight to
+  those rows instead of scanning millions (`EXPLAIN` shows *Index Scan*).
+  Indexes cost space and slow inserts slightly, so only add the ones queries need.
+- **JSONB for top processes**: a variable-length list always read together
+  with its snapshot, so a separate table would add joins for no benefit.
+  It's still queryable: `top_cpu->0->>'name'`.
+- **`TIMESTAMPTZ`**: timestamps with time zone, stored as UTC.
+- The schema file is **embedded into the binary at build time** (CMake
+  `configure_file`) and applied on startup with `CREATE ... IF NOT EXISTS`,
+  so it's safe to run repeatedly.
+
+### Getting data in without slowing the network (`DbWriter`)
+```
+handler threads ──submit()──► [bounded queue] ──► writer thread ──► PostgreSQL
+                  (instant)                       batch + transaction + retry
+```
+The same producer–consumer pattern as the agent, reusing the same
+`ThreadSafeQueue`, now moved to `common/`.
+1. **Decoupling:** handler threads only enqueue, which takes microseconds.
+   A slow or dead database never stalls agent connections.
+2. **Batching:** up to 500 rows per transaction. Each `COMMIT` waits for
+   the disk, so 1 commit for 500 rows is far faster than 500 commits.
+   A batch is written when it's **full** or after **1 s**, whichever
+   comes first, so data is never delayed long.
+3. **Retries:** if a write fails, the writer waits 2 s and retries the
+   **same batch**. Meanwhile new data waits in the queue (bounded at
+   50,000 items; the oldest are dropped beyond that).
+
+### Transactions make retries safe
+Each batch is one transaction: `BEGIN … COMMIT`. If anything fails
+midway, `ROLLBACK` undoes everything, so the database never holds half a
+batch, and retrying cannot create duplicates. This is **atomicity**, the
+"A" in **ACID**. Tested by adding a constraint that one row in the middle
+of a batch violates: none of the batch's rows are saved.
+
+### Prepared statements and SQL injection
+Inserts use `PQprepare` + `PQexecPrepared` with `$1, $2 …` placeholders:
+- The SQL is parsed and planned **once per connection**, not once per row.
+- **Values are sent separately from the SQL text.** A node named
+  `x'); DROP TABLE metrics; --` is stored as plain text and never runs as
+  SQL. Tested.
+Building SQL with string concatenation would be an injection hole, because
+host names come from the network.
+
+### A bug found in testing: prepare order
+The first version prepared its statements right after connecting, before
+creating the tables. PostgreSQL checks that tables exist **at prepare
+time**, so on a brand-new database every insert failed. Fixed: connect,
+create schema, then prepare. Prepared statements belong to one connection,
+so they are prepared again after every reconnect.
+
+### Other details
+- **libpq RAII:** results are wrapped in `unique_ptr` with a custom deleter
+  (`PQclear`), so there's no leak even when an exception is thrown.
+- **Interface + fake for tests:** `DbWriter` depends on the abstract
+  `MetricStore`. Unit tests pass a fake in-memory store to test batching
+  and retry logic with no database. `PgStore` is tested separately against
+  real PostgreSQL. This is **dependency inversion**.
+- Database tests run in a **throw-away PostgreSQL schema** (namespace) per
+  test, dropped afterwards, so they never touch real data. They run only
+  when `SYSMON_TEST_DB` is set:
+  ```bash
+  SYSMON_TEST_DB=postgresql://sysmon:sysmon@localhost:5432/sysmon ctest --test-dir build
+  ```
+- **Shutdown order:** stop the network server first (no new data), then
+  stop the writer, which flushes everything queued. The log prints
+  `db final: written=… lost=…`.
+
+### Measured
+Two agents at 0.5 s intervals, PostgreSQL stopped for 7 s mid-run:
+`agents sent 75 snapshots + 3 events = 78; db final: written=78 lost=0`,
+and the largest gap between stored samples was 0.5 s.
+
+### Questions to be ready for
+1. Why PostgreSQL? Why not write to a file? (Queries, indexes, concurrent
+   readers, constraints, transactions.) When would you choose a
+   time-series database like TimescaleDB or InfluxDB?
+2. Explain your schema. Why is top_cpu JSONB and not a separate table?
+3. What index did you add and why? How do you check that a query uses it? (`EXPLAIN`)
+4. Why batch inserts? What is the trade-off? (Throughput vs latency, bounded by the 1 s flush.)
+5. What is a transaction? What does ACID mean? How does it make retries safe?
+6. What is SQL injection and how did you prevent it?
+7. What happens when the database goes down? Can data be lost? (Buffered and
+   retried; lost only if the outage outlasts the 50,000-item queue.)
+8. Why not insert directly from the network threads?
+9. The table grows forever. What would you do? (Retention `DELETE`,
+   partitioning by time, downsampling old data to 1-minute averages.)
+10. How did you test database code? (Interface + fake, throw-away schema, real DB tests.)
+
+## Next: Milestone 5
+**Anomaly detection**: thresholds, z-scores and memory-leak trends over the
+stored data, written to an `alerts` table, in Python.

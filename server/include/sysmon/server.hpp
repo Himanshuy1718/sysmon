@@ -38,6 +38,9 @@ struct ServerConfig {
 using MetricsHandler = std::function<void(const MetricSnapshot&)>;
 // Receives status events such as "node-1 UP" / "node-1 DOWN" (for logging).
 using EventHandler = std::function<void(const std::string&)>;
+// Receives structured UP/DOWN changes (stored in the database).
+using StatusHandler = std::function<void(const std::string& host, const std::string& address,
+                                         bool up, std::int64_t timestamp_ms)>;
 
 class Server {
 public:
@@ -46,6 +49,9 @@ public:
 
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
+
+    // Optional; set before start().
+    void set_status_handler(StatusHandler h) { on_status_ = std::move(h); }
 
     void start();  // binds the port (throws net::NetError) and starts threads
     void stop();   // closes everything and joins all threads
@@ -70,6 +76,7 @@ private:
     ServerConfig config_;
     MetricsHandler on_metrics_;
     EventHandler on_event_;
+    StatusHandler on_status_;
     NodeRegistry registry_;
 
     net::Socket listener_;

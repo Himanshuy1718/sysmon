@@ -44,6 +44,9 @@ Message decode(const std::string& payload);
 std::string snapshot_to_json(const MetricSnapshot& s);
 MetricSnapshot snapshot_from_json(const std::string& json);
 
+// A process list as a JSON array, e.g. for a JSONB database column.
+std::string processes_to_json(const std::vector<ProcessUsage>& list);
+
 std::int64_t now_ms();
 
 }  // namespace sysmon::protocol
