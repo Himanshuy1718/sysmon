@@ -65,3 +65,13 @@ ORDER BY pg_total_relation_size(relid) DESC;
 
 -- 9. Retention: delete samples older than 7 days (run periodically, e.g. cron).
 -- DELETE FROM metrics WHERE ts < now() - interval '7 days';
+
+-- 10. Alerts (Milestone 5): open ones first, then the most recent.
+SELECT host, kind, severity,
+       CASE WHEN resolved_at IS NULL THEN 'OPEN' ELSE 'resolved' END AS state,
+       started_at::time(0) AS started,
+       round(extract(epoch FROM coalesce(resolved_at, now()) - started_at)) AS lasted_s,
+       left(message, 90) AS message
+FROM alerts
+ORDER BY resolved_at IS NOT NULL, started_at DESC
+LIMIT 20;

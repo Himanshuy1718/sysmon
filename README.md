@@ -23,7 +23,7 @@ LLM with retrieval-augmented generation (RAG).
 | 2 | Thread-safe queue + collector/sender threads | ✅ Done |
 | 3 | TCP server + agent client, framing, heartbeat, reconnect | ✅ Done |
 | 4 | PostgreSQL storage | ✅ Done |
-| 5 | Anomaly detector + alerts | ⏳ |
+| 5 | Anomaly detector + alerts (Python) | ✅ Done |
 | 6 | FastAPI REST API | ⏳ |
 | 7 | RAG diagnostics assistant (Ollama) | ⏳ |
 | 8 | Docker Compose + GitHub Actions CI | ⏳ |
@@ -106,9 +106,19 @@ sysmon/
 │   ├── sql/schema.sql              # tables + indexes (embedded into the binary)
 │   ├── src/ ...  main.cpp
 │   └── tests/                      # 36 tests: protocol, framing, end-to-end, storage
+├── analytics/                      # Python: anomaly detection (Milestone 5)
+│   ├── config.toml                 # every threshold, tunable without code changes
+│   ├── sql/alerts.sql              # alerts table + "one open alert per kind" index
+│   ├── sysmon_analytics/
+│   │   ├── rules.py                # pure detection functions (threshold, z-score, leak)
+│   │   ├── store.py                # PostgreSQL access (psycopg 3)
+│   │   └── detector.py             # the service loop: detect → open/refresh/resolve
+│   └── tests/                      # 26 pytest tests (20 synthetic, 6 real DB)
 └── scripts/
     ├── setup_db.sh                 # create the sysmon database user and database
-    └── queries.sql                 # example SQL queries over the collected data
+    ├── queries.sql                 # example SQL queries over the collected data
+    ├── stress_cpu.sh               # load every core (triggers cpu_high)
+    └── leak_memory.py              # simulated memory leak (triggers memory_leak)
 ```
 
 ---
@@ -538,6 +548,146 @@ and the largest gap between stored samples was 0.5 s.
    partitioning by time, downsampling old data to 1-minute averages.)
 10. How did you test database code? (Interface + fake, throw-away schema, real DB tests.)
 
-## Next: Milestone 5
-**Anomaly detection**: thresholds, z-scores and memory-leak trends over the
-stored data, written to an `alerts` table, in Python.
+## Milestone 5 — concepts explained
+
+### Setup (once)
+The detector is Python. It gets its **own virtual environment** inside the
+project, so it never touches conda or your thesis environments.
+```bash
+sudo apt install -y python3-venv python3-pip
+conda deactivate                      # if (base) is showing
+cd ~/projects/sysmon/analytics
+python3 -m venv .venv
+source .venv/bin/activate             # prompt now starts with (.venv)
+pip install -r requirements.txt
+pytest                                # 26 tests (6 skipped unless SYSMON_TEST_DB is set)
+```
+Each new terminal needs `source ~/projects/sysmon/analytics/.venv/bin/activate`
+before running the detector. `deactivate` leaves the environment.
+
+### Try it (4 tabs)
+```bash
+# Tab 1: server with database
+./build/server/sysmon_server --port 9000 --timeout 5 --quiet --db $SYSMON_DB
+# Tab 2: one agent
+./build/agent/sysmon_agent --server 127.0.0.1:9000 --name node-1 --interval 1
+# Tab 3: the detector
+cd analytics && source .venv/bin/activate && python -m sysmon_analytics.detector
+# Tab 4: wait ~30 s for a baseline, then cause trouble:
+./scripts/stress_cpu.sh 60                  # → spike_cpu_pct, then cpu_high, then RESOLVED
+python3 scripts/leak_memory.py 20 2500      # → memory_leak (after ~80 s), names the process
+# Ctrl+C the agent in Tab 2                  → node_down (critical)
+psql $SYSMON_DB -c "\x" -f scripts/queries.sql   # query 10 lists the alerts
+```
+
+### Measured (live run)
+| What I did | What the detector reported |
+|---|---|
+| loaded all cores | after 10 s: `spike_cpu_pct` "50.4% vs normal 1.1% (z = 28.7); top process: yes" |
+| kept them loaded | after 40 s: `cpu_high` "above 90% for 29 s, avg 100%; top process: yes (pid 319)" |
+| stopped the load | `cpu_high` RESOLVED |
+| leaked 20 MB/s | after ~80 s: `memory_leak` "+13.45%/min (R² = 0.98), full in ~6 min; fastest-growing process: python3 (+1550 MB)" |
+| killed an agent | `node_down` (critical) |
+
+### Architecture
+```
+PostgreSQL (metrics, nodes) ──every 10 s──► detector.py
+                                              │ fetch last 15 min per host
+                                              │ rules.py: evaluate_host()   (pure functions)
+                                              ▼
+                            alerts table: OPEN / refresh / RESOLVE
+```
+The detector is a **separate process** from the C++ server. Analysis can be
+written in Python (numpy, quick to change), restarted or scaled on its own,
+and a crash in it never affects data collection. The database is the contract
+between the two.
+
+### The four rules (`rules.py`)
+**1. Sustained threshold (`cpu_high`, `mem_high`)**
+Fires only if **every** sample in the last 30 s is above 90%. Using "every"
+rather than "average" means a 2-second blip never fires it.
+
+**2. Spike, by z-score (`spike_<metric>`)**
+```
+baseline = this machine's last 10 minutes (excluding the last 20 s)
+z = (mean(last 20 s) − mean(baseline)) / std(baseline)
+```
+z = "how many standard deviations above normal". z ≥ 4 almost never happens
+by chance. The baseline is **per machine**, so a database server that always
+writes 50 MB/s isn't flagged for writing 52 MB/s.
+- `min_delta`: on an idle machine, CPU going from 0.1% to 0.5% gives a huge z
+  but means nothing, so a jump must also be big in absolute terms.
+- `std = 0` (perfectly flat baseline): division by zero is avoided, treated as z = ∞.
+- A spike alert closes once the new level becomes the norm. Spikes detect
+  **changes**, thresholds detect **states**, so for a sustained load,
+  `cpu_high` takes over.
+
+**3. Memory leak by linear regression (`memory_leak`)**
+Fit a straight line to memory % over time (`numpy.polyfit`, least squares):
+- **slope** = growth in % per minute
+- **R²** (0 to 1) = how well the line fits. Near 1 means steady growth, which is
+  what a leak looks like. Normal usage goes up and down, so R² is low.
+- Time until memory is full = (100 − current%) / slope.
+- Culprit = the process whose memory grew most since it **first appeared** in
+  the window.
+
+**4. Node down (`node_down`)**
+The C++ server's watchdog already marks silent nodes `DOWN`. The detector
+turns that into a critical alert and resolves it when the node is back.
+
+### Alert lifecycle: open → refresh → resolve
+- **Deduplication:** a problem that lasts 10 minutes is **one** alert updated 60
+  times, not 60 alerts. The database enforces it with a **partial unique index**:
+  ```sql
+  CREATE UNIQUE INDEX ... ON alerts (host, kind) WHERE resolved_at IS NULL;
+  ```
+  Even two detectors running at once can't create duplicates.
+  `INSERT ... ON CONFLICT (host, kind) WHERE resolved_at IS NULL DO UPDATE`
+  opens or refreshes in one atomic statement. `RETURNING (xmax = 0)` tells
+  whether the row was newly inserted.
+- **Hysteresis:** fire at 90%, but resolve only below 80%. Without the gap, a
+  value hovering around 90% (89, 91, 89 …) would open and close an alert every
+  10 seconds ("flapping"). That kind of noise teaches people to ignore alerts,
+  known as **alert fatigue**.
+- **Stale hosts:** if a host sent no data for 60 s, its open alerts are left
+  alone. We can't know it recovered, and `node_down` already reports the silence.
+
+### A bug found in the live demo
+The first leak alert blamed `python (+2 MB)`, the wrong process. The real
+leaker grew by 2.4 GB, but it **started after the window began**, so it
+wasn't in the first sample's top-5 list. The code compared only processes
+present in both the first and last samples. **Fix:** measure each process's
+growth from the first sample where it appears. A regression test reproduces
+the exact situation.
+
+### Testing
+- **Rules are pure functions**, tested with synthetic data where the answer is
+  known: a steady ramp of +2%/min must give slope 2.0 and R² > 0.99; a sine wave
+  must not be a leak; random noise must not be a spike; one dip below 90%
+  must prevent `cpu_high`.
+- **Database tests** (`SYSMON_TEST_DB`) run in a throw-away schema: open with
+  the culprit named, no duplicates over repeated passes, the database rejecting
+  a second open alert, hysteresis keeping an alert open at 85%, node down and
+  back up, stale hosts left alone.
+
+### Note on the demo
+Both demo agents run on the **same laptop**, so they see the same CPU and
+memory, and both raise the same alerts. On real separate machines, each
+agent would see only its own problems.
+
+### Questions to be ready for
+1. What rules did you implement and why those? (Threshold, z-score spike, trend/leak, liveness.)
+2. Why "every sample above 90% for 30 s" and not "average above 90%"?
+3. Explain the z-score. Why per-machine baselines? What breaks when std = 0?
+4. How do you detect a memory leak? What does R² tell you?
+5. What is hysteresis? What is alert fatigue and how do you reduce it?
+6. How do you avoid duplicate alerts? (Partial unique index + ON CONFLICT upsert.)
+7. Why a separate Python process instead of doing it in the C++ server?
+8. What are the limits? (Fixed thresholds; z-score assumes a roughly stable
+   baseline; daily patterns like nightly backups would need seasonal baselines;
+   could add ML methods like Isolation Forest.)
+9. Tell me about a bug you found. (The wrong leak culprit.)
+
+## Next: Milestone 6
+A **REST API** (FastAPI): `GET /nodes`, `GET /metrics/{host}`, `GET /alerts`,
+so dashboards and the AI assistant can read the data over HTTP.
